@@ -15,9 +15,9 @@ while [[ $# -gt 0 ]]; do
       REBUILD=true
       shift
       ;;
-    --ssh-key)
+    --ssh-key|-i)
       if [[ $# -lt 2 ]]; then
-        echo "error: --ssh-key requires a path argument" >&2
+        echo "error: $1 requires a path argument" >&2
         exit 1
       fi
       SSH_KEY="$2"
@@ -25,6 +25,10 @@ while [[ $# -gt 0 ]]; do
       ;;
     --ssh-key=*)
       SSH_KEY="${1#--ssh-key=}"
+      shift
+      ;;
+    -i=*)
+      SSH_KEY="${1#-i=}"
       shift
       ;;
     *)
