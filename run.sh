@@ -5,15 +5,33 @@ SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
 IMAGE_NAME="claude-code-sandbox"
 ENV_FILE="${SCRIPT_DIR}/.env"
 
-# Extract --rebuild from args without disturbing order of remaining args
+# Extract --rebuild and --ssh-key from args without disturbing order of remaining args
 REBUILD=false
+SSH_KEY=""
 FILTERED=()
-for arg in "$@"; do
-  if [[ "$arg" == "--rebuild" ]]; then
-    REBUILD=true
-  else
-    FILTERED+=("$arg")
-  fi
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --rebuild)
+      REBUILD=true
+      shift
+      ;;
+    --ssh-key)
+      if [[ $# -lt 2 ]]; then
+        echo "error: --ssh-key requires a path argument" >&2
+        exit 1
+      fi
+      SSH_KEY="$2"
+      shift 2
+      ;;
+    --ssh-key=*)
+      SSH_KEY="${1#--ssh-key=}"
+      shift
+      ;;
+    *)
+      FILTERED+=("$1")
+      shift
+      ;;
+  esac
 done
 set -- "${FILTERED[@]+"${FILTERED[@]}"}"
 
@@ -36,6 +54,26 @@ if $REBUILD || ! docker image inspect "$IMAGE_NAME" &>/dev/null; then
   docker build --build-arg USER_UID="$(id -u)" -t "$IMAGE_NAME" "$SCRIPT_DIR"
 fi
 
+# If --ssh-key was provided, copy it ephemerally into the workspace root and
+# ensure it is removed when this script exits (normal exit, error, or signal).
+EPHEMERAL_KEY=""
+CLAUDE_EXTRA_ARGS=()
+if [[ -n "$SSH_KEY" ]]; then
+  SSH_KEY="$(realpath "$SSH_KEY")"
+  if [[ ! -f "$SSH_KEY" ]]; then
+    echo "error: ssh key not found: $SSH_KEY" >&2
+    exit 1
+  fi
+  EPHEMERAL_KEY="${WORKSPACE}/$(basename "$SSH_KEY")"
+  if [[ -e "$EPHEMERAL_KEY" ]]; then
+    echo "error: refusing to overwrite existing file in workspace: $EPHEMERAL_KEY" >&2
+    exit 1
+  fi
+  install -m 600 "$SSH_KEY" "$EPHEMERAL_KEY"
+  trap 'rm -f "$EPHEMERAL_KEY"' EXIT
+  CLAUDE_EXTRA_ARGS+=(--append-system-prompt "An ephemeral SSH private key is available at /workspace/$(basename "$SSH_KEY") (mode 0600). Use it for git/ssh operations that require authentication (e.g. via GIT_SSH_COMMAND='ssh -i /workspace/$(basename "$SSH_KEY")' or ssh -i). The file is deleted when this session ends.")
+fi
+
 # Bind-mount host ~/.claude directly — same UID inside and outside means no permission issues
 docker run --rm -it \
   ${ANTHROPIC_API_KEY:+-e ANTHROPIC_API_KEY="$ANTHROPIC_API_KEY"} \
@@ -43,4 +81,5 @@ docker run --rm -it \
   -v "${HOME}/.claude.json:/home/claude/.claude.json" \
   -v "$WORKSPACE:/workspace" \
   "$IMAGE_NAME" \
+  "${CLAUDE_EXTRA_ARGS[@]+"${CLAUDE_EXTRA_ARGS[@]}"}" \
   "$@"
