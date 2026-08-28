@@ -74,8 +74,33 @@ if [[ -n "$SSH_KEY" ]]; then
     exit 1
   fi
   install -m 600 "$SSH_KEY" "$EPHEMERAL_KEY"
-  trap 'rm -f "$EPHEMERAL_KEY"' EXIT
-  CLAUDE_EXTRA_ARGS+=(--append-system-prompt "An ephemeral SSH private key is available at /workspace/$(basename "$SSH_KEY") (mode 0600). Use it for git/ssh operations that require authentication (e.g. via GIT_SSH_COMMAND='ssh -i /workspace/$(basename "$SSH_KEY")' or ssh -i). The file is deleted when this session ends.")
+  # ssh-keygen -p may leave a "<file>.old" backup — clean both.
+  trap 'rm -f "$EPHEMERAL_KEY" "$EPHEMERAL_KEY.old"' EXIT
+
+  # If the ephemeral key is passphrase-protected, prompt for it (up to 3 tries)
+  # and strip the passphrase in place so ssh/git can use the key non-interactively
+  # inside the sandbox.
+  if ! ssh-keygen -y -P "" -f "$EPHEMERAL_KEY" >/dev/null 2>&1; then
+    echo "ssh key is passphrase-protected; unlocking ephemeral copy" >&2
+    unlocked=false
+    for _ in 1 2 3; do
+      read -rsp "Passphrase for $SSH_KEY: " KEY_PASSPHRASE < /dev/tty
+      echo
+      if ssh-keygen -p -P "$KEY_PASSPHRASE" -N "" -f "$EPHEMERAL_KEY" >/dev/null 2>&1; then
+        unset KEY_PASSPHRASE
+        unlocked=true
+        break
+      fi
+      unset KEY_PASSPHRASE
+      echo "incorrect passphrase" >&2
+    done
+    if ! $unlocked; then
+      echo "error: failed to unlock ssh key after 3 attempts" >&2
+      exit 1
+    fi
+  fi
+
+  CLAUDE_EXTRA_ARGS+=(--append-system-prompt "An ephemeral SSH private key is available at /workspace/$(basename "$SSH_KEY") (mode 0600, no passphrase). Use it for git/ssh operations that require authentication (e.g. via GIT_SSH_COMMAND='ssh -i /workspace/$(basename "$SSH_KEY")' or ssh -i). The file is deleted when this session ends.")
 fi
 
 # Bind-mount host ~/.claude directly — same UID inside and outside means no permission issues
