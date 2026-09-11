@@ -5,14 +5,19 @@ SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
 IMAGE_NAME="claude-code-sandbox"
 ENV_FILE="${SCRIPT_DIR}/.env"
 
-# Extract --rebuild and --ssh-key from args without disturbing order of remaining args
+# Extract --rebuild, --update and --ssh-key from args without disturbing order of remaining args
 REBUILD=false
+UPDATE=false
 SSH_KEY=""
 FILTERED=()
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --rebuild)
       REBUILD=true
+      shift
+      ;;
+    --update)
+      UPDATE=true
       shift
       ;;
     --ssh-key|-i)
@@ -54,8 +59,12 @@ if [[ -z "${ANTHROPIC_API_KEY:-}" && -f "$ENV_FILE" ]]; then
   source "$ENV_FILE"
 fi
 
-if $REBUILD || ! docker image inspect "$IMAGE_NAME" &>/dev/null; then
-  docker build --build-arg USER_UID="$(id -u)" -t "$IMAGE_NAME" "$SCRIPT_DIR"
+if $UPDATE || $REBUILD || ! docker image inspect "$IMAGE_NAME" &>/dev/null; then
+  BUILD_ARGS=(--build-arg USER_UID="$(id -u)")
+  if $UPDATE; then
+    BUILD_ARGS+=(--build-arg CLAUDE_CACHE_BUST="$(date +%s)")
+  fi
+  docker build "${BUILD_ARGS[@]}" -t "$IMAGE_NAME" "$SCRIPT_DIR"
 fi
 
 # If --ssh-key was provided, copy it ephemerally into the workspace root and

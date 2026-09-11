@@ -14,7 +14,8 @@ RUN apt-get update && apt-get install -y \
     ripgrep \
     && rm -rf /var/lib/apt/lists/*
 
-RUN npm install -g @anthropic-ai/claude-code
+ARG CLAUDE_CACHE_BUST=0
+RUN echo "cache-bust: $CLAUDE_CACHE_BUST" && npm install -g @anthropic-ai/claude-code
 
 RUN pip3 config set global.break-system-packages true 2>/dev/null || true
 
