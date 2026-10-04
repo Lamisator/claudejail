@@ -5,6 +5,42 @@ SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
 IMAGE_NAME="claude-code-sandbox"
 ENV_FILE="${SCRIPT_DIR}/.env"
 
+# `run.sh install [DIR]` symlinks this script as "claudejail" into a
+# user-managed PATH directory. A symlink (not a copy) keeps SCRIPT_DIR resolving
+# to this repo, so the Dockerfile and .env are still found.
+if [[ "${1:-}" == "install" ]]; then
+  if [[ $# -gt 2 ]]; then
+    echo "usage: $0 install [DIR]" >&2
+    exit 1
+  fi
+  if [[ -n "${2:-}" ]]; then
+    INSTALL_DIR="$2"
+  else
+    # Prefer a user bin dir that is already on PATH; fall back to ~/.local/bin.
+    INSTALL_DIR="${HOME}/.local/bin"
+    for candidate in "${HOME}/.local/bin" "${HOME}/bin"; do
+      if [[ ":${PATH}:" == *":${candidate}:"* ]]; then
+        INSTALL_DIR="$candidate"
+        break
+      fi
+    done
+  fi
+  mkdir -p "$INSTALL_DIR"
+  INSTALL_DIR="$(realpath "$INSTALL_DIR")"
+  TARGET="${INSTALL_DIR}/claudejail"
+  if [[ -e "$TARGET" && ! -L "$TARGET" ]]; then
+    echo "error: refusing to overwrite existing non-symlink file: $TARGET" >&2
+    exit 1
+  fi
+  ln -sfn "${SCRIPT_DIR}/$(basename "$(readlink -f "$0")")" "$TARGET"
+  echo "installed: $TARGET -> $(readlink "$TARGET")"
+  if [[ ":${PATH}:" != *":${INSTALL_DIR}:"* ]]; then
+    echo "note: $INSTALL_DIR is not on your PATH; add this to your shell profile:" >&2
+    echo "  export PATH=\"$INSTALL_DIR:\$PATH\"" >&2
+  fi
+  exit 0
+fi
+
 # Extract --rebuild, --update and --ssh-key from args without disturbing order of remaining args
 REBUILD=false
 UPDATE=false
