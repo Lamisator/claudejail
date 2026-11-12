@@ -103,9 +103,12 @@ if $UPDATE || $REBUILD || ! docker image inspect "$IMAGE_NAME" &>/dev/null; then
   docker build "${BUILD_ARGS[@]}" -t "$IMAGE_NAME" "$SCRIPT_DIR"
 fi
 
-# If --ssh-key was provided, copy it ephemerally into the workspace root and
-# ensure it is removed when this script exits (normal exit, error, or signal).
-EPHEMERAL_KEY=""
+# If --ssh-key was provided, load it into a private, per-session ssh-agent on
+# the host and forward only the agent socket into the container. The key itself
+# never enters the container or touches disk unencrypted; the sandbox can ask
+# the agent to sign but cannot read or copy the key. The agent is killed when
+# this script exits (normal exit, error, or signal).
+DOCKER_SSH_ARGS=()
 CLAUDE_EXTRA_ARGS=()
 if [[ -n "$SSH_KEY" ]]; then
   SSH_KEY="$(realpath "$SSH_KEY")"
@@ -113,39 +116,23 @@ if [[ -n "$SSH_KEY" ]]; then
     echo "error: ssh key not found: $SSH_KEY" >&2
     exit 1
   fi
-  EPHEMERAL_KEY="${WORKSPACE}/$(basename "$SSH_KEY")"
-  if [[ -e "$EPHEMERAL_KEY" ]]; then
-    echo "error: refusing to overwrite existing file in workspace: $EPHEMERAL_KEY" >&2
+  AGENT_DIR="$(mktemp -d -t claudejail-agent.XXXXXX)"
+  AGENT_SOCK="${AGENT_DIR}/agent.sock"
+  AGENT_PID=""
+  trap '[[ -n "$AGENT_PID" ]] && kill "$AGENT_PID" 2>/dev/null; rm -rf "$AGENT_DIR"' EXIT
+  AGENT_PID="$(ssh-agent -a "$AGENT_SOCK" -s | sed -n 's/^SSH_AGENT_PID=\([0-9]*\);.*/\1/p')"
+  if [[ -z "$AGENT_PID" ]]; then
+    echo "error: failed to start ssh-agent" >&2
     exit 1
   fi
-  install -m 600 "$SSH_KEY" "$EPHEMERAL_KEY"
-  # ssh-keygen -p may leave a "<file>.old" backup — clean both.
-  trap 'rm -f "$EPHEMERAL_KEY" "$EPHEMERAL_KEY.old"' EXIT
-
-  # If the ephemeral key is passphrase-protected, prompt for it (up to 3 tries)
-  # and strip the passphrase in place so ssh/git can use the key non-interactively
-  # inside the sandbox.
-  if ! ssh-keygen -y -P "" -f "$EPHEMERAL_KEY" >/dev/null 2>&1; then
-    echo "ssh key is passphrase-protected; unlocking ephemeral copy" >&2
-    unlocked=false
-    for _ in 1 2 3; do
-      read -rsp "Passphrase for $SSH_KEY: " KEY_PASSPHRASE < /dev/tty
-      echo
-      if ssh-keygen -p -P "$KEY_PASSPHRASE" -N "" -f "$EPHEMERAL_KEY" >/dev/null 2>&1; then
-        unset KEY_PASSPHRASE
-        unlocked=true
-        break
-      fi
-      unset KEY_PASSPHRASE
-      echo "incorrect passphrase" >&2
-    done
-    if ! $unlocked; then
-      echo "error: failed to unlock ssh key after 3 attempts" >&2
-      exit 1
-    fi
+  # ssh-add prompts for the passphrase itself if the key is protected.
+  if ! SSH_AUTH_SOCK="$AGENT_SOCK" ssh-add -q "$SSH_KEY" < /dev/tty; then
+    echo "error: failed to add ssh key to agent" >&2
+    exit 1
   fi
 
-  CLAUDE_EXTRA_ARGS+=(--append-system-prompt "An ephemeral SSH private key is available at /workspace/$(basename "$SSH_KEY") (mode 0600, no passphrase). Use it for git/ssh operations that require authentication (e.g. via GIT_SSH_COMMAND='ssh -i /workspace/$(basename "$SSH_KEY")' or ssh -i). The file is deleted when this session ends.")
+  DOCKER_SSH_ARGS+=(-v "$AGENT_SOCK:/run/ssh-agent.sock" -e SSH_AUTH_SOCK=/run/ssh-agent.sock)
+  CLAUDE_EXTRA_ARGS+=(--append-system-prompt "An SSH agent holding the user's key is forwarded into this sandbox (SSH_AUTH_SOCK=/run/ssh-agent.sock). Plain ssh and git commands authenticate through it automatically; no -i or GIT_SSH_COMMAND is needed. The key file itself is not available in the sandbox.")
 fi
 
 # Bind-mount host ~/.claude directly — same UID inside and outside means no permission issues
@@ -154,6 +141,7 @@ docker run --rm -it \
   -v "${HOME}/.claude:/home/claude/.claude" \
   -v "${HOME}/.claude.json:/home/claude/.claude.json" \
   -v "$WORKSPACE:/workspace" \
+  "${DOCKER_SSH_ARGS[@]+"${DOCKER_SSH_ARGS[@]}"}" \
   "$IMAGE_NAME" \
   "${CLAUDE_EXTRA_ARGS[@]+"${CLAUDE_EXTRA_ARGS[@]}"}" \
   "$@"
