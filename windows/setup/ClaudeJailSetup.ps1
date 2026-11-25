@@ -37,6 +37,13 @@ try {
 } catch { }
 [System.Windows.Forms.Application]::EnableVisualStyles()
 
+# The window is hidden, so show unexpected errors instead of exiting silently.
+trap {
+  [void][System.Windows.Forms.MessageBox]::Show(('claudejail setup stopped because of an unexpected error:' + "`n`n" + $_.Exception.Message),
+    'claudejail setup', [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Error)
+  exit 1
+}
+
 # ---------------------------------------------------------------------------
 # Shared code. Runs in the UI thread and, as text, in background runspaces.
 # ---------------------------------------------------------------------------
@@ -119,11 +126,20 @@ $Core = {
     $r = Invoke-Native -FilePath $WslExe -ArgumentList $ArgumentList -StdinText $StdinText -NoLog:$NoLog
     if ($sync -and $sync.Cancel) { throw 'Setup was cancelled.' }
     if ($Check -and $r.ExitCode -ne 0) {
-      $msg = ($r.Error + "`n" + $r.Output).Trim()
+      $msg = $r.Error
+      if (-not $NoLog) { $msg = $msg + "`n" + $r.Output }
+      $msg = $msg.Trim()
       if ($msg.Length -gt 600) { $msg = '...' + $msg.Substring($msg.Length - 600) }
       throw "wsl.exe failed (exit code $($r.ExitCode)): $msg"
     }
     return $r
+  }
+
+  # Writes text to a file inside the distribution without echoing it (keeps
+  # secrets out of logs), with a tight umask, stripping a BOM .NET may add.
+  function Write-WslFile([string]$User, [string]$Path, [string]$Text, [string]$Mode) {
+    $sh = "umask 077; sed '1s/^\xEF\xBB\xBF//' > `$1 && chmod `$2 `$1"
+    [void](Invoke-Wsl -Check -NoLog -StdinText $Text -ArgumentList @('-d', $DistroName, '-u', $User, '--exec', 'sh', '-c', $sh, 'sh', $Path, $Mode))
   }
 
   function Test-WslReady {
@@ -323,13 +339,16 @@ try {
       L "$f enabled (restart needed: $($r.RestartNeeded))"
     }
   }
-  L (& wsl.exe --install --no-distribution 2>&1 | Out-String)
-  if ($LASTEXITCODE -ne 0) {
-    L (& wsl.exe --update --web-download 2>&1 | Out-String)
-  }
 } catch {
   L ('ERROR: ' + $_.Exception.Message)
   exit 1
+}
+# wsl.exe writes to stderr; under 'Stop' that would throw in Windows PowerShell.
+# A failure here is not fatal before a restart: setup checks WSL again afterwards.
+$ErrorActionPreference = 'Continue'
+L (cmd.exe /c "wsl.exe --install --no-distribution 2>&1" | Out-String)
+if ($LASTEXITCODE -ne 0) {
+  L (cmd.exe /c "wsl.exe --update --web-download 2>&1" | Out-String)
 }
 if ($restart) { exit 3010 }
 exit 0
@@ -723,7 +742,7 @@ $p.OnEnter = {
 
 function Set-ResumeAfterRestart {
   $cmd = '"' + $PowerShellExe + '" -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File "' +
-    (Join-Path $AppDir 'ClaudeJailSetup.ps1') + '" -Resume -Ref ' + $Ref
+    (Join-Path $AppDir 'ClaudeJailSetup.ps1') + '" -Resume -Ref ' + $Ref + ' -Repo ' + $Repo
   New-ItemProperty -Path $RunOnceKey -Name 'claudejailSetup' -Value $cmd -PropertyType String -Force | Out-Null
 }
 
@@ -957,7 +976,7 @@ $InstallBody = {
   Step 'Copying the setup script into the environment'
   [void](Invoke-Wsl -Check -ArgumentList @('-d', $DistroName, '-u', 'root', '--exec', 'mkdir', '-p', '/opt/claudejail-setup'))
   $text = [IO.File]::ReadAllText((Join-Path $AppDir 'provision.sh')).Replace("`r`n", "`n")
-  [void](Invoke-Wsl -Check -NoLog -StdinText $text -ArgumentList @('-d', $DistroName, '-u', 'root', '--exec', 'tee', '/opt/claudejail-setup/provision.sh'))
+  Write-WslFile 'root' '/opt/claudejail-setup/provision.sh' $text '644'
 
   Step 'Installing Docker, Claude Code and claudejail (takes a few minutes)'
   [void](Invoke-Wsl -Check -ArgumentList @('-d', $DistroName, '-u', 'root', '--exec', 'env',
@@ -967,8 +986,7 @@ $InstallBody = {
   $envFile = "$linuxHome/claudejail/.env"
   if ($Opt.AuthMode -eq 'apikey') {
     if ($Opt.ApiKey) {
-      [void](Invoke-Wsl -Check -NoLog -StdinText ("ANTHROPIC_API_KEY=$($Opt.ApiKey)`n") -ArgumentList @('-d', $DistroName, '-u', $user, '--exec', 'tee', $envFile))
-      [void](Invoke-Wsl -Check -ArgumentList @('-d', $DistroName, '-u', $user, '--exec', 'chmod', '600', $envFile))
+      Write-WslFile $user $envFile ("ANTHROPIC_API_KEY=$($Opt.ApiKey)`n") '600'
       Write-Log 'API key saved.'
     }
   } else {
@@ -980,8 +998,7 @@ $InstallBody = {
       $t = [IO.File]::ReadAllText($pair[0]).Replace("`r`n", "`n")
       if (-not $t.EndsWith("`n")) { $t += "`n" }
       $dest = "$linuxHome/.ssh/$($pair[1])"
-      [void](Invoke-Wsl -Check -NoLog -StdinText $t -ArgumentList @('-d', $DistroName, '-u', $user, '--exec', 'tee', $dest))
-      [void](Invoke-Wsl -Check -ArgumentList @('-d', $DistroName, '-u', $user, '--exec', 'chmod', $pair[2], $dest))
+      Write-WslFile $user $dest $t $pair[2]
     }
     Write-Log "SSH key $($Opt.SshKey) copied."
   }
@@ -1012,6 +1029,7 @@ $InstallBody = {
 $p.OnEnter = {
   $state.InstallFailed = $false
   $ui.InstallError.Text = ''
+  $ui.Next.Text = 'Next >'
   $ui.Next.Enabled = $false
   $ui.Back.Enabled = $false
   $ui.Step.Text = 'Starting...'
@@ -1021,6 +1039,7 @@ $p.OnEnter = {
   Start-Worker -Body $InstallBody -Vars @{ Opt = $state.Opt } -OnDone {
     if ($sync.Error) {
       $state.InstallFailed = $true
+      $sync.Percent = 0
       $ui.Progress.Style = 'Continuous'
       $ui.Progress.Value = 0
       $ui.InstallError.Text = ("Setup didn't finish: $($sync.Error)`n`nThe full log is in $LogPath. " +
@@ -1141,6 +1160,10 @@ $form.Add_FormClosing({
     if ($answer -ne 'Yes') { $e.Cancel = $true; return }
     $sync.Cancel = $true
     try { if ($sync.CurrentProcess) { $sync.CurrentProcess.Kill() } } catch { }
+    # Killing wsl.exe leaves apt/docker running inside; stop the distribution too.
+    if (Test-DistroRegistered) {
+      Start-Process -FilePath $WslExe -ArgumentList "--terminate $DistroName" -WindowStyle Hidden
+    }
   }
 })
 
@@ -1167,13 +1190,13 @@ $timer.Add_Tick({
       $ui.Progress.Value = [Math]::Min(100, [Math]::Max(0, [int]$sync.Percent))
     }
   }
-  $w = $state.Worker
-  if ($w -and $w.Handle.IsCompleted) {
+  $worker = $state.Worker
+  if ($worker -and $worker.Handle.IsCompleted) {
     $state.Worker = $null
-    try { [void]$w.PS.EndInvoke($w.Handle) } catch { if (-not $sync.Error) { $sync.Error = $_.Exception.Message } }
-    $w.PS.Dispose()
-    $w.RS.Dispose()
-    & $w.OnDone
+    try { [void]$worker.PS.EndInvoke($worker.Handle) } catch { if (-not $sync.Error) { $sync.Error = $_.Exception.Message } }
+    $worker.PS.Dispose()
+    $worker.RS.Dispose()
+    & $worker.OnDone
   }
 })
 

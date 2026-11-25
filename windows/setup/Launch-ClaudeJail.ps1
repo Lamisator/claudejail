@@ -15,6 +15,12 @@ param(
 $ErrorActionPreference = 'Stop'
 Add-Type -AssemblyName System.Windows.Forms
 
+trap {
+  [void][System.Windows.Forms.MessageBox]::Show(('claudejail could not start: ' + $_.Exception.Message), 'claudejail',
+    [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Error)
+  exit 1
+}
+
 function Show-Error([string]$Message) {
   [void][System.Windows.Forms.MessageBox]::Show($Message, 'claudejail',
     [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Error)
@@ -52,8 +58,12 @@ function ConvertTo-LinuxPath([string]$WinPath) {
     if (-not $p) { return '/' }
     return $p
   }
-  # C:\Users\me\code -> /mnt/c/Users/me/code
+  # C:\Users\me\code -> /mnt/c/Users/me/code (WSL only mounts local drives)
   if ($WinPath -match '^([A-Za-z]):\\?(.*)$') {
+    $drive = New-Object System.IO.DriveInfo ($Matches[1] + ':')
+    if ($drive.DriveType -eq [System.IO.DriveType]::Network) {
+      Show-Error 'Network drives are not supported. Copy the project to a local drive or into the claudejail projects folder.'
+    }
     $p = '/mnt/' + $Matches[1].ToLowerInvariant()
     $rest = ($Matches[2] -replace '\\', '/').TrimEnd('/')
     if ($rest) { $p += '/' + $rest }
