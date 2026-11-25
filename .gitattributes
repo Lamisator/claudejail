@@ -1,0 +1,6 @@
+# Shell scripts and the Dockerfile run in Linux: always LF, even on Windows checkouts.
+*.sh        text eol=lf
+Dockerfile  text eol=lf
+# Windows scripts: CRLF.
+*.ps1       text eol=crlf
+*.cmd       text eol=crlf
